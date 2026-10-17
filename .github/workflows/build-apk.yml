@@ -13,11 +13,179 @@ jobs:
       - name: 1. Dosyalari Cihaza Cek
         uses: actions/checkout@v4
 
-      - name: 2. ZIP Dosyasini Otomatik Ac
+      - name: 2. ZIP Dosyasini Ac ve Kodu Onar
         run: |
           if ls *.zip 1> /dev/null 2>&1; then
-            unzip -o "*.zip"
+            unzip -o *.zip
           fi
+          mkdir -p app/src/main/java/com/guvenliadimlar/app
+          cat << 'EOF' > app/src/main/java/com/guvenliadimlar/app/MainActivity.kt
+          package com.guvenliadimlar.app
+
+          import android.Manifest
+          import android.app.AppOpsManager
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.net.VpnService
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Process
+          import android.provider.Settings
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.appcompat.app.AppCompatActivity
+          import androidx.core.app.ActivityCompat
+          import androidx.core.content.ContextCompat
+          import kotlin.random.Random
+
+          class MainActivity : AppCompatActivity() {
+
+              private lateinit var statusText: TextView
+              private lateinit var usageReportText: TextView
+              private var currentPairingCode: String = "------"
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  val scrollView = ScrollView(this)
+                  val container = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 64, 48, 64)
+                  }
+
+                  val title = TextView(this).apply {
+                      text = "Güvenli Adımlar - Aile Güvenliği"
+                      textSize = 22f
+                      setPadding(0, 0, 0, 16)
+                  }
+
+                  val subtitle = TextView(this).apply {
+                      text = "Açık ve şeffaf aile güvenlik uygulaması. Çocuk cihazında gizli çalışmaz; yalnızca açık izinlerle konum, uygulama kullanım süresi ve DNS alan adı bilgilerini paylaşır."
+                      textSize = 14f
+                      setPadding(0, 0, 0, 32)
+                  }
+
+                  statusText = TextView(this).apply {
+                      text = "Durum: Eşleştirme veya İzin Bekleniyor"
+                      textSize = 15f
+                      setPadding(0, 0, 0, 24)
+                  }
+
+                  val btnGenerateCode = Button(this).apply {
+                      text = "Ebeveyn Modu: Tek Kullanımlık Eşleştirme Kodu Üret"
+                      setOnClickListener {
+                          currentPairingCode = Random.nextInt(100000, 999999).toString()
+                          statusText.text = "Ebeveyn Eşleştirme Kodu: $currentPairingCode (15 dk geçerli)\nSaklama Sınırı: Konum 7 gün, Aktivite 30 gün."
+                      }
+                  }
+
+                  val btnLocationPerm = Button(this).apply {
+                      text = "Çocuk Modu 1: Konum ve Bildirim İzni Ver"
+                      setOnClickListener { requestSafetyPermissions() }
+                  }
+
+                  val btnUsagePerm = Button(this).apply {
+                      text = "Çocuk Modu 2: Uygulama Kullanım Erişimi İzni"
+                      setOnClickListener {
+                          if (!hasUsageStatsPermission()) {
+                              startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+                          } else {
+                              loadUsageReport()
+                          }
+                      }
+                  }
+
+                  val btnVpnPerm = Button(this).apply {
+                      text = "Çocuk Modu 3: DNS Alan Adı Korumasını Başlat"
+                      setOnClickListener {
+                          val intent = VpnService.prepare(this@MainActivity)
+                          if (intent != null) {
+                              startActivityForResult(intent, 1002)
+                          } else {
+                              startService(Intent(this@MainActivity, DnsMonitorVpnService::class.java))
+                              Toast.makeText(this@MainActivity, "DNS Alan Adı Koruması Aktif", Toast.LENGTH_LONG).show()
+                          }
+                      }
+                  }
+
+                  val btnRefreshReport = Button(this).apply {
+                      text = "Bugünkü Uygulama Sürelerini Göster"
+                      setOnClickListener { loadUsageReport() }
+                  }
+
+                  usageReportText = TextView(this).apply {
+                      text = "Henüz kullanım raporu yüklenmedi."
+                      textSize = 14f
+                      setPadding(0, 32, 0, 0)
+                  }
+
+                  container.addView(title)
+                  container.addView(subtitle)
+                  container.addView(statusText)
+                  container.addView(btnGenerateCode)
+                  container.addView(btnLocationPerm)
+                  container.addView(btnUsagePerm)
+                  container.addView(btnVpnPerm)
+                  container.addView(btnRefreshReport)
+                  container.addView(usageReportText)
+
+                  scrollView.addView(container)
+                  setContentView(scrollView)
+              }
+
+              private fun requestSafetyPermissions() {
+                  val perms = mutableListOf(
+                      Manifest.permission.ACCESS_FINE_LOCATION,
+                      Manifest.permission.ACCESS_COARSE_LOCATION
+                  )
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                      perms.add(Manifest.permission.POST_NOTIFICATIONS)
+                  }
+                  ActivityCompat.requestPermissions(this, perms.toTypedArray(), 1001)
+              }
+
+              override fun onRequestPermissionsResult(
+                  requestCode: Int,
+                  permissions: Array<out String>,
+                  grantResults: IntArray
+              ) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (requestCode == 1001 && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                      val serviceIntent = Intent(this, SafetyForegroundService::class.java)
+                      ContextCompat.startForegroundService(this, serviceIntent)
+                      statusText.text = "Durum: Görünür Konum Güvenlik Servisi Çalışıyor"
+                  }
+              }
+
+              private fun hasUsageStatsPermission(): Boolean {
+                  val appOps = getSystemService(Context.APP_OPS_SERVICE) as AppOpsManager
+                  val mode = appOps.checkOpNoThrow(
+                      AppOpsManager.OPSTR_GET_USAGE_STATS,
+                      Process.myUid(),
+                      packageName
+                  )
+                  return mode == AppOpsManager.MODE_ALLOWED
+              }
+
+              private fun loadUsageReport() {
+                  if (!hasUsageStatsPermission()) {
+                      usageReportText.text = "Lütfen önce Uygulama Kullanım Erişimi İzni butonuna tıklayıp izin verin."
+                      return
+                  }
+                  val usageList = UsageStatsHelper.getDailyUsage(this)
+                  if (usageList.isEmpty()) {
+                      usageReportText.text = "Bugün 1 dakikadan uzun kullanılan uygulama kaydı bulunamadı."
+                  } else {
+                      val formatted = usageList.joinToString("\n") { "• ${it.packageName}: ${it.minutes} dk" }
+                      usageReportText.text = "Günlük Uygulama Kullanım Raporu:\n\n$formatted"
+                  }
+              }
+          }
+          EOF
 
       - name: 3. Java JDK 17 Kurulumu
         uses: actions/setup-java@v4
@@ -25,8 +193,8 @@ jobs:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: 4. Android SDK Kurulumu
-        uses: android-actions/setup-android@v3
+      - name: 4. Android SDK Lisanslarini Onayla
+        run: yes | $ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager --licenses || true
 
       - name: 5. Gradle Kurulumu
         uses: gradle/actions/setup-gradle@v4
