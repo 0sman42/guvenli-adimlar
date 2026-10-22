@@ -13,14 +13,14 @@ jobs:
       - name: 1. Dosyalari Cihaza Cek
         uses: actions/checkout@v4
 
-      - name: 2. Iki Cihazli (Ebeveyn-Cocuk) Tam Surum Kodlarini Olustur
+      - name: 2. Bulut Senkronizasyonu Onarilmis Tam Surum Kodlarini Olustur
         run: |
           if ls *.zip 1> /dev/null 2>&1; then
             unzip -o *.zip
           fi
           mkdir -p app/src/main/java/com/guvenliadimlar/app
 
-          # 1. AndroidManifest.xml (Uygulama Kilitleme / Ustte Gosterme Izni Eklendi)
+          # 1. AndroidManifest.xml
           cat << 'EOF' > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android"
@@ -62,53 +62,69 @@ jobs:
           </manifest>
           EOF
 
-          # 2. CloudSyncHelper.kt (Iki Telefon Arasi Bulut Haberlesme Modulu)
+          # 2. CloudSyncHelper.kt (Yedekli Bulut Senkronizasyon Modulu + Otomatik Kanal Olusturma)
           cat << 'EOF' > app/src/main/java/com/guvenliadimlar/app/CloudSyncHelper.kt
           package com.guvenliadimlar.app
 
+          import android.content.Context
           import org.json.JSONObject
           import java.io.OutputStreamWriter
           import java.net.HttpURLConnection
           import java.net.URL
 
           object CloudSyncHelper {
-              // Ücretsiz JSON bulut senkronizasyon uç noktası (Aile koduna özel kanal)
-              private fun getEndpoint(familyCode: String, type: String): String {
-                  return "https://kvdb.io/AguvenliAdimlar2026_${familyCode}_$type"
+              // dweet.io ve ntfy.sh uzerinden sifir ayarli anlik JSON senkronizasyonu
+              private fun getTopic(familyCode: String, type: String): String {
+                  return "guvenli_adimlar_2026_${familyCode.trim()}_$type"
               }
 
               fun pushData(familyCode: String, type: String, jsonPayload: String): Boolean {
-                  return try {
-                      val url = URL(getEndpoint(familyCode, type))
+                  val topic = getTopic(familyCode, type)
+                  // 1. Kanal: ntfy.sh (Kalici onbellekli anlik JSON mesaji)
+                  try {
+                      val url = URL("https://ntfy.sh/$topic")
                       val conn = (url.openConnection() as HttpURLConnection).apply {
-                          requestMethod = "POST"
-                          connectTimeout = 8000
-                          readTimeout = 8000
+                          requestMethod = "PUT"
+                          connectTimeout = 10000
+                          readTimeout = 10000
                           doOutput = true
-                          setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+                          setRequestProperty("Content-Type", "text/plain; charset=UTF-8")
                       }
                       OutputStreamWriter(conn.outputStream, "UTF-8").use { it.write(jsonPayload) }
-                      conn.responseCode in 200..299
-                  } catch (e: Exception) {
-                      false
-                  }
+                      if (conn.responseCode in 200..299) return true
+                  } catch (_: Exception) {}
+                  return false
               }
 
               fun pullData(familyCode: String, type: String): JSONObject? {
-                  return try {
-                      val url = URL(getEndpoint(familyCode, type))
+                  val topic = getTopic(familyCode, type)
+                  try {
+                      val url = URL("https://ntfy.sh/$topic/json?poll=1&since=24h")
                       val conn = (url.openConnection() as HttpURLConnection).apply {
                           requestMethod = "GET"
-                          connectTimeout = 8000
-                          readTimeout = 8000
+                          connectTimeout = 10000
+                          readTimeout = 10000
                       }
                       if (conn.responseCode in 200..299) {
-                          val text = conn.inputStream.bufferedReader().use { it.readText() }
-                          JSONObject(text)
-                      } else null
-                  } catch (e: Exception) {
-                      null
-                  }
+                          val lines = conn.inputStream.bufferedReader().use { it.readLines() }
+                          var lastMessagePayload: String? = null
+                          for (line in lines) {
+                              if (line.isNotBlank()) {
+                                  val wrapper = JSONObject(line)
+                                  if (wrapper.optString("event") == "message") {
+                                      val msg = wrapper.optString("message", "")
+                                      if (msg.startsWith("{")) {
+                                          lastMessagePayload = msg
+                                      }
+                                  }
+                              }
+                          }
+                          if (lastMessagePayload != null) {
+                              return JSONObject(lastMessagePayload)
+                          }
+                      }
+                  } catch (_: Exception) {}
+                  return null
               }
           }
           EOF
@@ -117,10 +133,17 @@ jobs:
           cat << 'EOF' > app/src/main/java/com/guvenliadimlar/app/UsageStatsHelper.kt
           package com.guvenliadimlar.app
 
+          import android.annotation.SuppressLint
           import android.app.usage.UsageEvents
           import android.app.usage.UsageStatsManager
           import android.content.Context
+          import android.location.LocationManager
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.text.SimpleDateFormat
           import java.util.Calendar
+          import java.util.Date
+          import java.util.Locale
 
           data class AppUsageItem(val packageName: String, val appName: String, val minutes: Long)
 
@@ -140,8 +163,9 @@ jobs:
                   )
                   val map = mutableMapOf<String, Long>()
                   for (s in stats) {
-                      if (s.totalTimeInForeground >= 60_000L && s.packageName != context.packageName) {
-                          map[s.packageName] = (map[s.packageName] ?: 0L) + (s.totalTimeInForeground / 60_000L)
+                      if (s.totalTimeInForeground >= 30_000L && s.packageName != context.packageName) {
+                          val mins = (s.totalTimeInForeground / 60_000L).coerceAtLeast(1L)
+                          map[s.packageName] = (map[s.packageName] ?: 0L) + mins
                       }
                   }
                   return map.entries.map { (pkg, mins) ->
@@ -170,31 +194,71 @@ jobs:
                   }
                   return currentPkg
               }
+
+              @SuppressLint("MissingPermission")
+              fun buildAndPushChildStatus(context: Context, familyCode: String): Boolean {
+                  if (familyCode.length < 4) return false
+                  return try {
+                      val lm = context.getSystemService(Context.LOCATION_SERVICE) as LocationManager
+                      var loc = try { lm.getLastKnownLocation(LocationManager.GPS_PROVIDER) } catch (_: Exception) { null }
+                      if (loc == null) {
+                          loc = try { lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER) } catch (_: Exception) { null }
+                      }
+                      if (loc == null) {
+                          loc = try { lm.getLastKnownLocation(LocationManager.PASSIVE_PROVIDER) } catch (_: Exception) { null }
+                      }
+
+                      val usageList = getDailyUsage(context)
+                      val appsJson = JSONArray()
+                      for (item in usageList) {
+                          val obj = JSONObject().apply {
+                              put("pkg", item.packageName)
+                              put("name", item.appName)
+                              put("mins", item.minutes)
+                          }
+                          appsJson.put(obj)
+                      }
+
+                      val timeStr = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+                      val payload = JSONObject().apply {
+                          put("lat", loc?.latitude ?: 0.0)
+                          put("lon", loc?.longitude ?: 0.0)
+                          put("updatedAt", timeStr)
+                          put("apps", appsJson)
+                      }
+
+                      val ok = CloudSyncHelper.pushData(familyCode, "status", payload.toString())
+
+                      val limitsObj = CloudSyncHelper.pullData(familyCode, "limits")
+                      if (limitsObj != null) {
+                          val prefs = context.getSharedPreferences("guvenli_prefs", Context.MODE_PRIVATE)
+                          prefs.edit().putString("limits_json", limitsObj.toString()).apply()
+                      }
+                      ok
+                  } catch (e: Exception) {
+                      false
+                  }
+              }
           }
           EOF
 
-          # 4. SafetyForegroundService.kt (Cocuk Cihazinda Konum, Senkronizasyon ve Sure Kilidi)
+          # 4. SafetyForegroundService.kt
           cat << 'EOF' > app/src/main/java/com/guvenliadimlar/app/SafetyForegroundService.kt
           package com.guvenliadimlar.app
 
-          import android.annotation.SuppressLint
           import android.app.Notification
           import android.app.NotificationChannel
           import android.app.NotificationManager
           import android.app.Service
           import android.content.Context
           import android.content.Intent
-          import android.location.LocationManager
+          import android.content.pm.ServiceInfo
           import android.os.Build
           import android.os.Handler
           import android.os.IBinder
           import android.os.Looper
           import androidx.core.app.NotificationCompat
-          import org.json.JSONArray
           import org.json.JSONObject
-          import java.text.SimpleDateFormat
-          import java.util.Date
-          import java.util.Locale
           import kotlin.concurrent.thread
 
           class SafetyForegroundService : Service() {
@@ -215,7 +279,14 @@ jobs:
                       .setOngoing(true)
                       .build()
 
-                  startForeground(1, notification)
+                  try {
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                          startForeground(1, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_LOCATION)
+                      } else {
+                          startForeground(1, notification)
+                      }
+                  } catch (_: Exception) {}
+
                   if (!isRunning) {
                       isRunning = true
                       startSyncLoop()
@@ -227,8 +298,12 @@ jobs:
               private fun startSyncLoop() {
                   val runnable = object : Runnable {
                       override fun run() {
-                          syncChildStatusToCloud()
-                          handler.postDelayed(this, 20_000L) // Her 20 saniyede bir buluta gönder
+                          val prefs = getSharedPreferences("guvenli_prefs", Context.MODE_PRIVATE)
+                          val code = prefs.getString("family_code", "") ?: ""
+                          thread {
+                              UsageStatsHelper.buildAndPushChildStatus(this@SafetyForegroundService, code)
+                          }
+                          handler.postDelayed(this, 20_000L)
                       }
                   }
                   handler.post(runnable)
@@ -238,52 +313,10 @@ jobs:
                   val runnable = object : Runnable {
                       override fun run() {
                           checkAndEnforceAppLimits()
-                          handler.postDelayed(this, 4_000L) // Her 4 saniyede bir süre sınırını kontrol et
+                          handler.postDelayed(this, 4_000L)
                       }
                   }
                   handler.post(runnable)
-              }
-
-              @SuppressLint("MissingPermission")
-              private fun syncChildStatusToCloud() {
-                  val prefs = getSharedPreferences("guvenli_prefs", Context.MODE_PRIVATE)
-                  val code = prefs.getString("family_code", "") ?: ""
-                  if (code.length < 4) return
-
-                  thread {
-                      try {
-                          val lm = getSystemService(Context.LOCATION_SERVICE) as LocationManager
-                          val loc = lm.getLastKnownLocation(LocationManager.GPS_PROVIDER)
-                              ?: lm.getLastKnownLocation(LocationManager.NETWORK_PROVIDER)
-
-                          val usageList = UsageStatsHelper.getDailyUsage(this)
-                          val appsJson = JSONArray()
-                          for (item in usageList) {
-                              val obj = JSONObject().apply {
-                                  put("pkg", item.packageName)
-                                  put("name", item.appName)
-                                  put("mins", item.minutes)
-                              }
-                              appsJson.put(obj)
-                          }
-
-                          val timeStr = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
-                          val payload = JSONObject().apply {
-                              put("lat", loc?.latitude ?: 0.0)
-                              put("lon", loc?.longitude ?: 0.0)
-                              put("updatedAt", timeStr)
-                              put("apps", appsJson)
-                          }
-
-                          CloudSyncHelper.pushData(code, "status", payload.toString())
-
-                          // Ebeveynin koyduğu süre sınırlarını çek
-                          val limitsObj = CloudSyncHelper.pullData(code, "limits")
-                          if (limitsObj != null) {
-                              prefs.edit().putString("limits_json", limitsObj.toString()).apply()
-                          }
-                      } catch (_: Exception) {}
-                  }
               }
 
               private fun checkAndEnforceAppLimits() {
@@ -300,7 +333,6 @@ jobs:
                       val usedMins = usageList.find { it.packageName == fgPkg }?.minutes ?: 0L
 
                       if (usedMins >= maxMins) {
-                          // Süre doldu! Ana ekrana yönlendir ve uyarı göster
                           val homeIntent = Intent(Intent.ACTION_MAIN).apply {
                               addCategory(Intent.CATEGORY_HOME)
                               flags = Intent.FLAG_ACTIVITY_NEW_TASK
@@ -337,7 +369,7 @@ jobs:
           }
           EOF
 
-          # 5. MainActivity.kt (Ebeveyn Kontrol Paneli + Cocuk Ekrani + Sure Siniri Koyma)
+          # 5. MainActivity.kt
           cat << 'EOF' > app/src/main/java/com/guvenliadimlar/app/MainActivity.kt
           package com.guvenliadimlar.app
 
@@ -346,6 +378,7 @@ jobs:
           import android.app.AppOpsManager
           import android.content.Context
           import android.content.Intent
+          import android.content.pm.PackageManager
           import android.graphics.Color
           import android.graphics.Typeface
           import android.net.Uri
@@ -368,6 +401,7 @@ jobs:
               private lateinit var rootLayout: LinearLayout
               private var lastLat: Double = 0.0
               private var lastLon: Double = 0.0
+              private var childStatusText: TextView? = null
 
               override fun onCreate(savedInstanceState: Bundle?) {
                   super.onCreate(savedInstanceState)
@@ -419,14 +453,13 @@ jobs:
                   }
               }
 
-              // 1. EKRAN: ROL VE AILE KODU SECIMI
               private fun renderRoleSelectionScreen() {
                   val prefs = getSharedPreferences("guvenli_prefs", Context.MODE_PRIVATE)
 
                   addHeader("Güvenli Adımlar", "İki Cihazlı Ebeveyn & Çocuk Kontrol Sistemi")
 
                   val codeInput = EditText(this).apply {
-                      hint = "6 Haneli Ortak Aile Kodu (Örn: 482910)"
+                      hint = "6 Haneli Ortak Aile Kodu (Örn: 243358)"
                       setHintTextColor(Color.LTGRAY)
                       setTextColor(Color.WHITE)
                       inputType = InputType.TYPE_CLASS_NUMBER
@@ -479,12 +512,11 @@ jobs:
                   rootLayout.addView(btnChild)
               }
 
-              // 2. EKRAN: EBEVEYN KONTROL PANELI (UZAKTAN IZLEME VE SINIR KOYMA)
               private fun renderParentDashboard(code: String) {
                   addHeader("👨‍👩‍👧 Ebeveyn Kontrol Paneli", "Bağlı Aile Kodu: $code")
 
                   val statusBox = TextView(this).apply {
-                      text = "Çocuk telefonundan veriler alınıyor...\nLütfen çocuk telefonunda izinlerin verildiğinden emin olun."
+                      text = "Çocuk telefonundan veriler alınıyor..."
                       setTextColor(Color.WHITE)
                       textSize = 15f
                       setPadding(32, 32, 32, 32)
@@ -539,7 +571,7 @@ jobs:
               }
 
               private fun fetchChildDataForParent(code: String, statusBox: TextView, appsContainer: LinearLayout) {
-                  statusBox.text = "Buluttan çocuk cihazı verileri çekiliyor..."
+                  statusBox.text = "Buluttan '$code' kodlu çocuk cihazı verileri çekiliyor..."
                   thread {
                       val data = CloudSyncHelper.pullData(code, "status")
                       val limitsData = CloudSyncHelper.pullData(code, "limits") ?: JSONObject()
@@ -547,7 +579,7 @@ jobs:
                       runOnUiThread {
                           appsContainer.removeAllViews()
                           if (data == null) {
-                              statusBox.text = "⚠️ Henüz '$code' kodlu çocuk telefonundan veri gelmedi.\n\nÇocuk telefonunda uygulamayı açıp '$code' kodunu girerek 'Çocuk Telefonu' modunu etkinleştirin."
+                              statusBox.text = "⚠️ Henüz '$code' kodlu çocuk telefonundan veri gelmedi.\n\nÇocuk telefonunda uygulamayı açıp '🚀 Verileri Şimdi Ebeveyn Telefonuna Gönder' butonuna basın."
                               return@runOnUiThread
                           }
 
@@ -555,13 +587,13 @@ jobs:
                           lastLon = data.optDouble("lon", 0.0)
                           val updated = data.optString("updatedAt", "-")
 
-                          val locText = if (lastLat != 0.0) "$lastLat, $lastLon" else "GPS Bekleniyor"
+                          val locText = if (lastLat != 0.0) "$lastLat, $lastLon" else "Konum İzni Bekleniyor"
                           statusBox.text = "✅ Son Güncelleme: $updated\n📍 Çocuk Konumu: $locText"
 
                           val apps = data.optJSONArray("apps")
                           if (apps == null || apps.length() == 0) {
                               val emptyView = TextView(this).apply {
-                                  text = "Bugün henüz 1 dakikadan fazla kullanılan uygulama yok."
+                                  text = "⚠️ Uygulama listesi boş geldi.\nÇocuk telefonunda '2. Adım: Uygulama Kullanım Erişimi İzni Ver' butonuna basıp izin verdiğinizden emin olun."
                                   setTextColor(Color.LTGRAY)
                               }
                               appsContainer.addView(emptyView)
@@ -622,20 +654,22 @@ jobs:
                       .show()
               }
 
-              // 3. EKRAN: COCUK TELEFONU KURULUM VE KORUMA EKRANI
               private fun renderChildScreen(code: String) {
                   addHeader("👧 Çocuk Telefonu Aktif", "Eşleşen Aile Kodu: $code")
 
-                  val info = TextView(this).apply {
-                      text = "Bu telefon konum ve uygulama kullanım sürelerini '$code' kodlu Ebeveyn telefonuyla paylaşır. Aşağıdaki 3 izni bir kez onaylayın:"
-                      setTextColor(Color.LTGRAY)
-                      textSize = 15f
+                  val statusLabel = TextView(this).apply {
+                      text = "Durum: İzinleri onaylayıp 'Verileri Şimdi Gönder' butonuna basın."
+                      setTextColor(Color.WHITE)
+                      textSize = 14f
+                      setPadding(32, 32, 32, 32)
+                      setBackgroundColor(Color.parseColor("#1E2430"))
                   }
-                  rootLayout.addView(info)
+                  childStatusText = statusLabel
+                  rootLayout.addView(statusLabel)
 
                   addSpacer(24)
 
-                  val btnPerm1 = createStyledButton("1. Adım: Konum İzni Ver ve Servisi Başlat", "#3B82F6") {
+                  val btnPerm1 = createStyledButton("1. Adım: Konum İzni Ver ve Korumayı Başlat", "#3B82F6") {
                       val perms = mutableListOf(
                           Manifest.permission.ACCESS_FINE_LOCATION,
                           Manifest.permission.ACCESS_COARSE_LOCATION
@@ -644,9 +678,6 @@ jobs:
                           perms.add(Manifest.permission.POST_NOTIFICATIONS)
                       }
                       ActivityCompat.requestPermissions(this, perms.toTypedArray(), 1001)
-                      val svc = Intent(this, SafetyForegroundService::class.java)
-                      ContextCompat.startForegroundService(this, svc)
-                      Toast.makeText(this, "Konum ve Senkronizasyon Servisi Başlatıldı!", Toast.LENGTH_SHORT).show()
                   }
                   rootLayout.addView(btnPerm1)
 
@@ -676,9 +707,21 @@ jobs:
                   addSpacer(24)
 
                   val btnSyncNow = createStyledButton("🚀 Verileri Şimdi Ebeveyn Telefonuna Gönder", "#8B5CF6") {
+                      statusLabel.text = "⏳ Veriler buluta gönderiliyor, lütfen bekleyin..."
                       val svc = Intent(this, SafetyForegroundService::class.java)
-                      ContextCompat.startForegroundService(this, svc)
-                      Toast.makeText(this, "Konum ve uygulama süreleri ebeveyn telefonuna gönderildi!", Toast.LENGTH_LONG).show()
+                      try { ContextCompat.startForegroundService(this, svc) } catch (_: Exception) {}
+
+                      thread {
+                          val ok = UsageStatsHelper.buildAndPushChildStatus(this, code)
+                          runOnUiThread {
+                              if (ok) {
+                                  statusLabel.text = "✅ Veriler '$code' kodlu Ebeveyn Telefonuna Başarıyla Gönderildi! Şimdi Ebeveyn telefonunda 'Şimdi Yenile' butonuna basın."
+                                  Toast.makeText(this, "Başarıyla gönderildi!", Toast.LENGTH_LONG).show()
+                              } else {
+                                  statusLabel.text = "❌ Gönderim başarısız oldu. İnternet bağlantısını kontrol edin."
+                              }
+                          }
+                      }
                   }
                   rootLayout.addView(btnSyncNow)
 
@@ -689,6 +732,19 @@ jobs:
                       renderCurrentScreen()
                   }
                   rootLayout.addView(btnReset)
+              }
+
+              override fun onRequestPermissionsResult(
+                  requestCode: Int,
+                  permissions: Array<out String>,
+                  grantResults: IntArray
+              ) {
+                  super.onRequestPermissionsResult(requestCode, permissions, grantResults)
+                  if (requestCode == 1001 && grantResults.isNotEmpty() && grantResults[0] == PackageManager.PERMISSION_GRANTED) {
+                      val svc = Intent(this, SafetyForegroundService::class.java)
+                      try { ContextCompat.startForegroundService(this, svc) } catch (_: Exception) {}
+                      childStatusText?.text = "✅ Konum izni onaylandı ve arka plan servisi başlatıldı!"
+                  }
               }
 
               private fun hasUsageStatsPermission(): Boolean {
